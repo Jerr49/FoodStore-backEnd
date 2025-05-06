@@ -94,7 +94,7 @@ const startServer = async () => {
     );
 
     // 2. THEN require models (this registers them with Mongoose)
-    require("./Models/Menu");
+    require("./models/Menu");
 
     // 3. THEN import routes
     const authRoutes = require("./Routes/auth");

@@ -1,4 +1,4 @@
-const { Category, MenuItem } = require("../Models/Menu");
+const { Category, MenuItem } = require("../models/Menu");
 const cloudinary = require("../Utils/cloudinaryConfig");
 
 // Category Management

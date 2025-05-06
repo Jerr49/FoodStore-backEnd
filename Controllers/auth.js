@@ -1,7 +1,7 @@
 require("dotenv").config();
 const { v4: uuidv4 } = require("uuid");
 const jwt = require("jsonwebtoken");
-const User = require("../Models/user");
+const User = require("../models/user");
 const { sendVerificationEmail } = require("../Utils/email");
 const redis = require("redis");
 const Queue = require("bull");
@@ -11,7 +11,7 @@ const compression = require("compression");
 const NodeCache = require("node-cache");
 const geoip = require("geoip-lite");
 const device = require("device");
-const TokenBlacklist = require("../Models/TokenBlacklist");
+const TokenBlacklist = require("../models/tokenBlacklist");
 
 const client = redis.createClient({
   url: process.env.REDIS_URL,
@@ -526,11 +526,11 @@ const refreshToken = async (req, res) => {
       Math.floor(Date.now() / 1000) +
       parseInt(process.env.JWT_ACCESS_EXPIRATION);
     const expiresAt = isExtendingSession
-      ? baseExpiration 
+      ? baseExpiration
       : user.lastActive &&
         Date.now() - new Date(user.lastActive).getTime() < 5 * 60 * 1000
-      ? decoded.exp 
-      : baseExpiration; 
+      ? decoded.exp
+      : baseExpiration;
 
     // 7. Token generation with updated security
     const newAccessToken = generateAccessToken(user, session.id, expiresAt);
@@ -626,14 +626,13 @@ const pingActivity = async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: 'Activity ping recorded'
+      message: "Activity ping recorded",
     });
-    
   } catch (error) {
-    console.error('Activity ping error:', error);
+    console.error("Activity ping error:", error);
     res.status(500).json({
       success: false,
-      message: 'Failed to record activity'
+      message: "Failed to record activity",
     });
   }
 };
@@ -930,5 +929,5 @@ module.exports = {
   verifyToken,
   refreshToken,
   checkAuth,
-  pingActivity
+  pingActivity,
 };
