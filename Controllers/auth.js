@@ -1,7 +1,7 @@
 require("dotenv").config();
 const { v4: uuidv4 } = require("uuid");
 const jwt = require("jsonwebtoken");
-const User = require("../models/user");
+const User = require("../Models/user");
 const { sendVerificationEmail } = require("../Utils/email");
 const redis = require("redis");
 const Queue = require("bull");
@@ -11,7 +11,7 @@ const compression = require("compression");
 const NodeCache = require("node-cache");
 const geoip = require("geoip-lite");
 const device = require("device");
-const TokenBlacklist = require("../models/tokenBlacklist");
+const TokenBlacklist = require("../Models/tokenBlacklist");
 
 const client = redis.createClient({
   url: process.env.REDIS_URL,

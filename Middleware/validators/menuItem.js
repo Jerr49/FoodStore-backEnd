@@ -1,6 +1,6 @@
 const { body, validationResult } = require("express-validator");
 const mongoose = require("mongoose");
-const { Category } = require("../../models/menu"); // Destructured import
+const { Category } = require("../../Models/menu"); // Destructured import
 const cloudinary = require("../../Utils/cloudinaryConfig");
 
 exports.validateMenuItem = [
