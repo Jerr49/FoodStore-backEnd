@@ -1,5 +1,5 @@
 const jwt = require("jsonwebtoken");
-const TokenBlacklist = require("../Models/tokenBlacklist");
+const TokenBlacklist = require("../models/tokenBlacklist");
 
 exports.verifyToken = async (req, res, next) => {
   // Skip auth for specific routes
