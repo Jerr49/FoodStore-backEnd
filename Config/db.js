@@ -8,10 +8,10 @@ const connectDB = async () => {
       maxPoolSize: 10,
       minPoolSize: 2,
       connectTimeoutMS: 10000,
-      family: 4,
+      family: 4,  
       heartbeatFrequencyMS: 30000,
       retryWrites: true,
-      retryReads: true,
+      retryReads: true, 
     });
 
     // Connection events for better debugging

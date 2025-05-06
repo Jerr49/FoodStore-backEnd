@@ -11,9 +11,8 @@ const compression = require("compression");
 const NodeCache = require("node-cache");
 const geoip = require("geoip-lite");
 const device = require("device");
-const TokenBlacklist = require("../Models/TokenBlackList");
+const TokenBlacklist = require("../Models/TokenBlacklist");
 
-// Initialize Redis client
 const client = redis.createClient({
   url: process.env.REDIS_URL,
   socket: {
@@ -41,7 +40,6 @@ client.on("connect", () => {
 
 client.connect();
 
-// Initialize Bull queue
 const emailQueue = new Queue("email", {
   redis: process.env.REDIS_URL || "redis://localhost:6379",
 });
@@ -59,15 +57,7 @@ emailQueue.on("completed", (job) => {
   console.log(`Job ${job.id} completed`);
 });
 
-// In-memory cache
 const cache = new NodeCache({ stdTTL: 3600 });
-
-// Rate limiters
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: "Too many requests from this IP, please try again later",
-});
 
 const sensitiveActionLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
@@ -75,25 +65,74 @@ const sensitiveActionLimiter = rateLimit({
   message: "Too many sensitive actions, please try again later",
 });
 
-// Environment variables
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "15m";
 const JWT_REFRESH_EXPIRES_IN = process.env.JWT_REFRESH_EXPIRES_IN || "7d";
 
-// Token generation
-const generateAccessToken = (user, sessionId) => {
-  return jwt.sign(
+const generateAccessToken = (user, sessionId, customExpiresIn = null) => {
+  // Calculate expiration
+  const expiresIn = customExpiresIn || JWT_EXPIRES_IN;
+  const expiresAt =
+    Math.floor(Date.now() / 1000) +
+    (typeof expiresIn === "string" ? parseJwtDuration(expiresIn) : expiresIn);
+
+  // Create token with enhanced claims
+  const token = jwt.sign(
     {
       userId: user._id,
       role: user.role,
       sessionVersion: user.sessionVersion,
       sessionId,
+      iss: process.env.JWT_ISSUER || "your-app-name",
+      aud: process.env.JWT_AUDIENCE || "your-app-client",
+      iat: Math.floor(Date.now() / 1000),
     },
-    JWT_SECRET,
-    { expiresIn: JWT_EXPIRES_IN }
+    process.env.JWT_SECRET,
+    {
+      expiresIn: expiresIn,
+      algorithm: "HS256",
+    }
+  );
+
+  return {
+    token,
+    expiresAt,
+  };
+};
+
+const generateRefreshToken = (user, sessionId) => {
+  return jwt.sign(
+    {
+      userId: user._id,
+      sessionVersion: user.sessionVersion,
+      sessionId,
+      iss: process.env.JWT_ISSUER || "your-app-name",
+      aud: process.env.JWT_AUDIENCE || "your-app-client",
+      iat: Math.floor(Date.now() / 1000),
+    },
+    process.env.JWT_REFRESH_SECRET,
+    {
+      expiresIn: process.env.JWT_REFRESH_EXPIRES_IN,
+      algorithm: "HS256",
+    }
   );
 };
+
+// Helper function to convert duration strings to seconds
+function parseJwtDuration(duration) {
+  const units = {
+    s: 1,
+    m: 60,
+    h: 60 * 60,
+    d: 60 * 60 * 24,
+  };
+
+  const match = duration.match(/^(\d+)([smhd])$/);
+  if (!match) return 3600;
+
+  return parseInt(match[1]) * units[match[2]];
+}
 
 const generateAndSaveVerificationToken = async (user) => {
   const emailVerificationToken = uuidv4();
@@ -106,19 +145,6 @@ const generateAndSaveVerificationToken = async (user) => {
   return emailVerificationToken;
 };
 
-const generateRefreshToken = (user, sessionId) => {
-  return jwt.sign(
-    {
-      userId: user._id,
-      sessionVersion: user.sessionVersion,
-      sessionId,
-    },
-    JWT_REFRESH_SECRET,
-    { expiresIn: JWT_REFRESH_EXPIRES_IN }
-  );
-};
-
-// Session management
 const createSession = (user, req) => {
   const ip =
     req.ip || req.headers["x-forwarded-for"] || req.connection.remoteAddress;
@@ -140,7 +166,6 @@ const createSession = (user, req) => {
   return session;
 };
 
-// Cache management
 const getUserFromCache = async (email) => {
   try {
     const cachedUser = cache.get(email);
@@ -177,7 +202,6 @@ const clearUserFromCache = async (email) => {
   }
 };
 
-// Register endpoint
 const register = async (req, res) => {
   const { email, password, confirmPassword, role } = req.body;
 
@@ -221,69 +245,186 @@ const register = async (req, res) => {
   }
 };
 
-// Login endpoint (with cache integration)
 const login = async (req, res) => {
   try {
     const { email, password } = req.body;
 
+    // Validate input
     if (!email || !password) {
-      return res
-        .status(400)
-        .json({ message: "Email and password are required" });
-    }
-
-    const normalizedEmail = email.toLowerCase();
-    let user = await User.findOne({ email: normalizedEmail }).select(
-      "+password +refreshToken +sessions +isEmailVerified +sessionVersion"
-    );
-
-    if (!user) {
-      return res.status(401).json({ message: "Invalid credentials" });
-    }
-
-    // Always compare password directly from database
-    const isPasswordValid = await user.comparePassword(password);
-    if (!isPasswordValid) {
-      return res.status(401).json({ message: "Invalid credentials" });
-    }
-
-    if (!user.isEmailVerified) {
-      return res.status(403).json({
-        message: "Please verify your email first",
-        code: "EMAIL_NOT_VERIFIED",
+      return res.status(400).json({
+        success: false,
+        message: "Email and password are required",
+        code: "MISSING_CREDENTIALS",
+        field: !email ? "email" : "password",
       });
     }
 
-    const session = user.addSession(req);
-    const accessToken = generateAccessToken(user, session.id);
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // 1. First check cache for user
+    const cachedUser = await getUserFromCache(normalizedEmail);
+    let user;
+
+    if (cachedUser) {
+      user = cachedUser;
+      // For password verification, we need fresh data from DB
+      user = await User.findOne({ email: normalizedEmail }).select(
+        "+password +refreshToken +sessions +isEmailVerified +sessionVersion +loginAttempts +lastLoginAttempt"
+      );
+    } else {
+      // 2. Database fallback with full security fields
+      user = await User.findOne({ email: normalizedEmail }).select(
+        "+password +refreshToken +sessions +isEmailVerified +sessionVersion +loginAttempts +lastLoginAttempt"
+      );
+
+      // Cache the user if found (without sensitive password field)
+      if (user) {
+        await setUserInCache(normalizedEmail, {
+          _id: user._id,
+          email: user.email,
+          role: user.role,
+          isEmailVerified: user.isEmailVerified,
+          sessionVersion: user.sessionVersion,
+          sessions: user.sessions,
+          loginAttempts: user.loginAttempts,
+          lastLoginAttempt: user.lastLoginAttempt,
+        });
+      }
+    }
+
+    // Security: Delay response for invalid credentials to prevent timing attacks
+    await new Promise((resolve) =>
+      setTimeout(resolve, 100 + Math.random() * 100)
+    );
+
+    if (!user) {
+      return res.status(404).json({
+        // Changed to 404 for "not found"
+        success: false,
+        message: "No account found with this email address",
+        code: "USER_NOT_FOUND",
+        field: "email",
+      });
+    }
+
+    // Check if account is temporarily locked
+    if (
+      user.loginAttempts >= 5 &&
+      Date.now() - user.lastLoginAttempt < 15 * 60 * 1000
+    ) {
+      return res.status(429).json({
+        success: false,
+        message:
+          "Account temporarily locked due to too many failed attempts. Please try again in 15 minutes.",
+        code: "ACCOUNT_LOCKED",
+        retryAfter: Math.ceil(
+          (15 * 60 * 1000 - (Date.now() - user.lastLoginAttempt)) / 1000
+        ),
+        field: "password",
+      });
+    }
+
+    const isPasswordValid = await user.comparePassword(password);
+
+    if (!isPasswordValid) {
+      // Update failed attempt counter
+      user.loginAttempts += 1;
+      user.lastLoginAttempt = new Date();
+      await user.save();
+
+      // Update cache with new attempt count
+      await setUserInCache(normalizedEmail, {
+        _id: user._id,
+        email: user.email,
+        role: user.role,
+        isEmailVerified: user.isEmailVerified,
+        sessionVersion: user.sessionVersion,
+        sessions: user.sessions,
+        loginAttempts: user.loginAttempts,
+        lastLoginAttempt: user.lastLoginAttempt,
+      });
+
+      const attemptsLeft = 5 - user.loginAttempts;
+      const warning =
+        attemptsLeft > 0
+          ? ` ${attemptsLeft} attempt${
+              attemptsLeft !== 1 ? "s" : ""
+            } remaining.`
+          : " Account will be temporarily locked.";
+
+      return res.status(401).json({
+        success: false,
+        message: "Incorrect password." + warning,
+        code: "INCORRECT_PASSWORD",
+        field: "password",
+        attemptsLeft,
+      });
+    }
+
+    // Reset login attempts on successful login
+    user.loginAttempts = 0;
+    user.lastLoginAttempt = new Date();
+
+    if (!user.isEmailVerified) {
+      return res.status(403).json({
+        success: false,
+        message: "Please verify your email address before logging in",
+        code: "EMAIL_NOT_VERIFIED",
+        field: "email",
+      });
+    }
+
+    // Create detailed session
+    const session = createSession(user, req);
+    user.sessions.push(session);
+
+    const { token: accessToken, expiresAt } = generateAccessToken(
+      user,
+      session.id
+    );
     const refreshToken = generateRefreshToken(user, session.id);
 
+    // Update user with new refresh token and save
     user.refreshToken = refreshToken;
     await user.save();
 
-    // Only cache non-sensitive user data
-    const userForCache = {
+    // Update cache with fresh user data
+    await setUserInCache(user.email, {
       _id: user._id,
       email: user.email,
       role: user.role,
       isEmailVerified: user.isEmailVerified,
       sessionVersion: user.sessionVersion,
       sessions: user.sessions,
-    };
-    await setUserInCache(user.email, userForCache);
+      loginAttempts: user.loginAttempts,
+      lastLoginAttempt: user.lastLoginAttempt,
+    });
 
-    res.cookie("jwt", refreshToken, {
+    // Set HTTP-only cookies
+    res.cookie("jwt", accessToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       sameSite: "Strict",
-      maxAge: 7 * 24 * 60 * 60 * 1000,
+      maxAge: process.env.JWT_ACCESS_EXPIRATION * 1000 || 15 * 60 * 1000,
+      path: "/",
+    });
+
+    res.cookie("rt", refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "Strict",
+      maxAge:
+        process.env.JWT_REFRESH_EXPIRATION * 1000 || 7 * 24 * 60 * 60 * 1000,
       path: "/api/auth/refresh-token",
     });
 
-    res.json({
+    // Successful login response
+    return res.json({
       success: true,
+      message: "Login successful",
       accessToken,
       refreshToken,
+      expiresAt,
       user: {
         id: user._id,
         email: user.email,
@@ -294,18 +435,37 @@ const login = async (req, res) => {
     });
   } catch (error) {
     console.error("Login error:", error);
-    res.status(500).json({
-      message: "Authentication failed",
+
+    // More specific error handling
+    if (error.name === "MongoError") {
+      return res.status(503).json({
+        success: false,
+        message:
+          "Our database service is temporarily unavailable. Please try again later.",
+        code: "DATABASE_UOWN",
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      message: "An unexpected error occurred during login",
+      code: "INTERNAL_SERVER_ERROR",
       error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 };
 
-// Refresh token endpoint (with cache integration)
 const refreshToken = async (req, res) => {
   try {
-    // Get token from cookies or Authorization header
-    const token = req.cookies?.jwt || req.headers.authorization?.split(" ")[1];
+    // 1. Token extraction with multiple fallbacks
+    const token =
+      req.cookies?.rt ||
+      req.cookies?.jwt ||
+      req.body?.refreshToken ||
+      req.headers.authorization?.split(" ")[1];
+
+    // Extract isExtendingSession flag from request
+    const { isExtendingSession = false } = req.body;
 
     if (!token) {
       return res.status(401).json({
@@ -314,93 +474,166 @@ const refreshToken = async (req, res) => {
       });
     }
 
-    // Verify token isn't blacklisted
-    const isBlacklisted = await client.get(`blacklist:${token}`);
-    if (isBlacklisted) {
+    // 2. Enhanced blacklist check
+    const [isBlacklistedRedis, isBlacklistedMongo] = await Promise.all([
+      client.get(`blacklist:${token}`),
+      TokenBlacklist.findOne({ token }).lean(),
+    ]);
+
+    if (isBlacklistedRedis || isBlacklistedMongo) {
+      res.clearCookie("jwt", { path: "/" });
+      res.clearCookie("rt", { path: "/api/auth/refresh-token" });
       return res.status(401).json({
         success: false,
         message: "Unauthorized - Token invalidated",
       });
     }
 
-    // Verify token signature
+    // 3. Token verification with additional checks
     const decoded = jwt.verify(token, process.env.JWT_REFRESH_SECRET, {
       algorithms: ["HS256"],
+      issuer: process.env.JWT_ISSUER,
+      audience: process.env.JWT_AUDIENCE,
     });
 
-    // Find user with refresh token
-    const user = await User.findById(decoded.userId).select(
-      "+refreshToken +sessionVersion +sessions"
-    );
+    // 4. User verification with session validation
+    const user = await User.findById(decoded.userId)
+      .select("+refreshToken +sessionVersion +sessions +isActive +lastActive")
+      .lean();
 
-    if (!user || user.refreshToken !== token) {
+    if (!user || user.refreshToken !== token || !user.isActive) {
       return res.status(401).json({
         success: false,
-        message: "Unauthorized - Invalid refresh token",
+        message: "Unauthorized - Invalid user or token",
       });
     }
 
-    // Verify session exists
+    // 5. Session validation
     const session = user.sessions.find((s) => s.id === decoded.sessionId);
-    if (!session) {
+    if (
+      !session?.active ||
+      session.ip !== req.ip ||
+      session.userAgent !== req.get("User-Agent")
+    ) {
       return res.status(401).json({
         success: false,
-        message: "Unauthorized - Session not found",
+        message: "Unauthorized - Session validation failed",
       });
     }
 
-    // Generate new tokens
-    const newAccessToken = generateAccessToken(user, session.id);
+    // 6. Calculate expiration based on activity
+    const baseExpiration =
+      Math.floor(Date.now() / 1000) +
+      parseInt(process.env.JWT_ACCESS_EXPIRATION);
+    const expiresAt = isExtendingSession
+      ? baseExpiration 
+      : user.lastActive &&
+        Date.now() - new Date(user.lastActive).getTime() < 5 * 60 * 1000
+      ? decoded.exp 
+      : baseExpiration; 
+
+    // 7. Token generation with updated security
+    const newAccessToken = generateAccessToken(user, session.id, expiresAt);
     const newRefreshToken = generateRefreshToken(user, session.id);
 
-    // Update user's refresh token
-    user.refreshToken = newRefreshToken;
-    await user.save();
+    // 8. Atomic update of user session
+    await User.updateOne(
+      { _id: user._id, "sessions.id": session.id },
+      {
+        $set: {
+          refreshToken: newRefreshToken,
+          lastActive: new Date(),
+          "sessions.$.lastUsed": new Date(),
+          "sessions.$.ip": req.ip,
+          "sessions.$.userAgent": req.get("User-Agent"),
+        },
+      }
+    );
 
-    // Set HTTP-only cookie
-    res.cookie("jwt", newRefreshToken, {
+    // 9. Secure cookie settings
+    const cookieOptions = {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       sameSite: "Strict",
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      path: "/",
+    };
+
+    res.cookie("jwt", newAccessToken, {
+      ...cookieOptions,
+      maxAge: process.env.JWT_ACCESS_EXPIRATION * 1000,
+    });
+
+    res.cookie("rt", newRefreshToken, {
+      ...cookieOptions,
+      maxAge: process.env.JWT_REFRESH_EXPIRATION * 1000,
       path: "/api/auth/refresh-token",
     });
 
-    // Return response
-    res.json({
-      success: true,
-      accessToken: newAccessToken,
-      // Only return refreshToken if not using HTTP-only cookies
-      // refreshToken: newRefreshToken,
-      user: {
-        id: user._id,
-        email: user.email,
-        role: user.role,
-      },
-    });
+    // 10. Response with security headers
+    return res
+      .header(
+        "Strict-Transport-Security",
+        "max-age=63072000; includeSubDomains; preload"
+      )
+      .header("X-Content-Type-Options", "nosniff")
+      .json({
+        success: true,
+        accessToken: newAccessToken,
+        refreshToken: newRefreshToken,
+        expiresAt,
+        user: {
+          id: user._id,
+          email: user.email,
+          role: user.role,
+        },
+      });
   } catch (error) {
+    // Enhanced error handling
+    res.clearCookie("jwt", { path: "/" });
+    res.clearCookie("rt", { path: "/api/auth/refresh-token" });
+
+    const errorResponse = {
+      success: false,
+      message: "Authentication failed",
+    };
+
+    if (error instanceof jwt.TokenExpiredError) {
+      errorResponse.message = "Session expired - Please login again";
+      return res.status(401).json(errorResponse);
+    }
+
+    if (error instanceof jwt.JsonWebTokenError) {
+      errorResponse.message = "Invalid token - Please login again";
+      return res.status(401).json(errorResponse);
+    }
+
     console.error("Refresh token error:", error);
-
-    // Clear invalid token cookie
-    res.clearCookie("jwt");
-
-    if (error.name === "TokenExpiredError") {
-      return res.status(401).json({
-        success: false,
-        message: "Session expired - Please login again",
-      });
-    }
-
-    if (error.name === "JsonWebTokenError") {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid token - Please login again",
-      });
-    }
-
     return res.status(500).json({
       success: false,
       message: "Internal server error",
+    });
+  }
+};
+
+const pingActivity = async (req, res) => {
+  try {
+    // Update lastActive timestamp
+    await User.findByIdAndUpdate(
+      req.user.id,
+      { lastActive: new Date() },
+      { new: true }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: 'Activity ping recorded'
+    });
+    
+  } catch (error) {
+    console.error('Activity ping error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to record activity'
     });
   }
 };
@@ -482,89 +715,68 @@ const verifyEmail = async (req, res) => {
   }
 };
 
-// Logout endpoint
 const logout = async (req, res) => {
   try {
-    // 1. Token extraction (keep your existing logic)
-    const tokenSources = [
-      req.cookies?.jwt,
-      req.headers.authorization?.split(" ")[1],
-      req.body?.token,
-    ];
-    const token = tokenSources.find((source) => !!source);
+    // Get token from any possible source
+    const token =
+      req.headers.authorization?.split(" ")[1] ||
+      req.cookies?.jwt ||
+      req.body?.token;
 
-    // 2. Cookie clearing (optimized)
-    const baseCookieOptions = {
+    // Clear cookies
+    res.clearCookie("jwt", {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       path: "/",
-    };
-
-    res.clearCookie("jwt", {
-      ...baseCookieOptions,
-      domain: process.env.COOKIE_DOMAIN,
     });
 
     res.clearCookie("rt", {
-      ...baseCookieOptions,
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
       path: "/api/auth/refresh-token",
     });
 
-    // 3. Immediate response if no token
-    if (!token) {
-      return res.status(200).json({
-        success: true,
-        message: "Session cleared",
-      });
-    }
+    // Blacklist the token if it exists and is valid
+    if (token && token !== "null" && token !== "undefined") {
+      try {
+        const decoded = jwt.decode(token);
 
-    // 4. Token processing
-    let decoded;
-    try {
-      decoded = jwt.decode(token);
+        // Check if token is already blacklisted
+        const existingToken = await TokenBlacklist.findOne({ token });
 
-      // 5. Blacklist token (simplified)
-      await TokenBlacklist.create({
-        token,
-        userId: decoded?.userId,
-        reason: "logout",
-        expiresAt: decoded?.exp
-          ? new Date(decoded.exp * 1000)
-          : new Date(Date.now() + 86400000),
-      });
-
-      // 6. Session cleanup (optional)
-      if (decoded?.userId && decoded?.sessionId) {
-        await User.updateOne(
-          { _id: decoded.userId },
-          { $pull: { sessions: { id: decoded.sessionId } } }
-        );
+        if (!existingToken) {
+          await TokenBlacklist.create({
+            token,
+            userId: decoded?.userId,
+            expiresAt: decoded?.exp
+              ? new Date(decoded.exp * 1000)
+              : new Date(Date.now() + 86400000), // Default 24h if no expiration
+          });
+        } else {
+          console.log("Token already blacklisted");
+        }
+      } catch (blacklistError) {
+        console.error("Blacklist error:", blacklistError);
+        // Consider whether to continue or return error
       }
-
-      return res.status(200).json({
-        success: true,
-        message: "Logged out successfully",
-      });
-    } catch (error) {
-      console.error("Logout processing error:", error);
-      return res.status(200).json({
-        success: true,
-        message: "Session cleared with partial cleanup",
-      });
     }
+
+    return res.status(200).json({
+      success: true,
+      message: "Logged out successfully",
+    });
   } catch (error) {
-    console.error("Logout system error:", error);
-    // Last effort to clear cookies
+    console.error("Logout error:", error);
+    // Final cleanup attempt
     res.clearCookie("jwt");
     res.clearCookie("rt");
-    return res.status(500).json({
-      success: false,
-      message: "Logout system error",
+    return res.status(200).json({
+      success: true,
+      message: "Session cleared",
     });
   }
 };
 
-// Logout all devices
 const logoutAllDevices = async (req, res) => {
   try {
     const user = await User.findById(req.user.userId);
@@ -588,7 +800,6 @@ const logoutAllDevices = async (req, res) => {
   }
 };
 
-// Get active sessions
 const getSessions = async (req, res) => {
   try {
     const user = await User.findById(req.user.userId).select("sessions");
@@ -613,7 +824,6 @@ const getSessions = async (req, res) => {
   }
 };
 
-// Terminate specific session
 const terminateSession = async (req, res) => {
   try {
     const { sessionId } = req.params;
@@ -637,7 +847,6 @@ const terminateSession = async (req, res) => {
   }
 };
 
-// Verify token middleware
 const verifyToken = async (req, res, next) => {
   try {
     const token = req.cookies?.jwt || req.headers.authorization?.split(" ")[1];
@@ -704,8 +913,8 @@ const checkAuth = async (req, res) => {
 };
 
 module.exports = {
-  register: [authLimiter, compression(), register],
-  login: [authLimiter, compression(), login],
+  register: [compression(), register],
+  login: [compression(), login],
   verifyEmail,
   logout: [compression(), logout],
   logoutAllDevices: [
@@ -715,8 +924,11 @@ module.exports = {
     logoutAllDevices,
   ],
   getSessions: [compression(), verifyToken, getSessions],
+  createSession: [compression(), verifyToken, createSession],
+  getUserFromCache: [compression(), verifyToken, getUserFromCache],
   terminateSession: [compression(), verifyToken, terminateSession],
   verifyToken,
   refreshToken,
   checkAuth,
+  pingActivity
 };

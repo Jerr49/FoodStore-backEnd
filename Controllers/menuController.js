@@ -1,7 +1,6 @@
 const { Category, MenuItem } = require("../Models/Menu");
 const cloudinary = require("../Utils/cloudinaryConfig");
 
-
 // Category Management
 exports.createCategory = async (req, res) => {
   try {
@@ -53,23 +52,25 @@ exports.getAllCategories = async (req, res) => {
 // Menu Item Management
 exports.addMenuItem = async (req, res) => {
   try {
+    console.log("Request received:", { body: req.body, file: req.file });
+
     const { name, description, price, categoryId } = req.body;
 
     // Validate input data
     if (!name || !description || !price || !categoryId) {
       return res.status(400).json({
         success: false,
-        message: 'All fields are required',
-        requiredFields: ['name', 'description', 'price', 'categoryId']
+        message: "All fields are required",
+        requiredFields: ["name", "description", "price", "categoryId"],
       });
     }
 
-    // Validate price is a positive number
+    // Validate price
     const numericPrice = parseFloat(price);
     if (isNaN(numericPrice) || numericPrice <= 0) {
       return res.status(400).json({
         success: false,
-        message: 'Price must be a positive number'
+        message: "Price must be a positive number",
       });
     }
 
@@ -78,13 +79,20 @@ exports.addMenuItem = async (req, res) => {
     if (!categoryExists) {
       return res.status(404).json({
         success: false,
-        message: 'Category not found'
+        message: "Category not found",
       });
     }
 
-    // Process image if uploaded
+    // Process image
     let imageData = null;
     if (req.file) {
+      console.log("Processing uploaded file:", {
+        originalname: req.file.originalname,
+        size: req.file.size,
+        mimetype: req.file.mimetype,
+        cloudinaryData: req.file,
+      });
+
       imageData = {
         public_id: req.file.public_id,
         url: req.file.secure_url,
@@ -92,23 +100,23 @@ exports.addMenuItem = async (req, res) => {
         height: req.file.height,
         format: req.file.format,
         bytes: req.file.bytes,
-        created_at: new Date() 
+        created_at: new Date(),
       };
+    } else {
+      console.warn("No file was uploaded with the request");
     }
 
-    // Create and save menu item
+    // Create menu item
     const newItem = new MenuItem({
       name: name.trim(),
       description: description.trim(),
       price: numericPrice,
       category: categoryId,
-      image: imageData
+      image: imageData,
     });
 
     const savedItem = await newItem.save();
-
-    // Log successful creation
-    console.log(`New menu item created: ${savedItem._id}`);
+    console.log("Menu item saved successfully:", savedItem._id);
 
     return res.status(201).json({
       success: true,
@@ -117,16 +125,16 @@ exports.addMenuItem = async (req, res) => {
         name: savedItem.name,
         price: savedItem.price,
         imageUrl: savedItem.image?.url || null,
-        category: savedItem.category
+        category: savedItem.category,
       },
-      message: 'Menu item created successfully'
+      message: "Menu item created successfully",
     });
-
   } catch (error) {
-    console.error('Error adding menu item:', {
+    console.error("Error in addMenuItem:", {
       error: error.message,
       stack: error.stack,
-      timestamp: new Date().toISOString()
+      requestBody: req.body,
+      requestFile: req.file,
     });
 
     // Cleanup uploaded image if DB operation failed
@@ -135,24 +143,21 @@ exports.addMenuItem = async (req, res) => {
         await cloudinary.uploader.destroy(req.file.public_id);
         console.log(`Cleaned up image: ${req.file.public_id}`);
       } catch (cloudinaryError) {
-        console.error('Image cleanup failed:', cloudinaryError);
+        console.error("Image cleanup failed:", cloudinaryError);
       }
     }
 
-    // Handle duplicate key errors (e.g., duplicate menu item names)
     if (error.code === 11000) {
       return res.status(409).json({
         success: false,
-        message: 'Menu item with this name already exists',
-        field: error.keyValue ? Object.keys(error.keyValue)[0] : 'unknown'
+        message: "Menu item with this name already exists",
       });
     }
 
     return res.status(500).json({
       success: false,
-      message: 'Failed to create menu item',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined,
-      referenceId: req.requestId 
+      message: "Failed to create menu item",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 };
