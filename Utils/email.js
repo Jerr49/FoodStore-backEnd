@@ -21,7 +21,7 @@ const transporter = nodemailer.createTransport({
 }); 
 
 const sendVerificationEmail = async (email, token) => {
-  const verificationLink = `http://localhost:5173/email-verification?token=${token}`;
+  const verificationLink = `https://foodstore-backend-nlzc.onrender.com/email-verification?token=${token}`;
 
   const mailOptions = {
     from: `"Food Store" <${process.env.EMAIL_USER}>`,
