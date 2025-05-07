@@ -1,4 +1,4 @@
-const { Category, MenuItem } = require("../models/menu.js");
+const { Category, MenuItem } = require("../models/menu");
 const cloudinary = require("../Utils/cloudinaryConfig");
 
 // Category Management
@@ -32,7 +32,7 @@ exports.createCategory = async (req, res) => {
     });
   }
 };
-
+ 
 exports.getAllCategories = async (req, res) => {
   try {
     const categories = await Category.find({});
